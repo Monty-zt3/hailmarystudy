@@ -4462,7 +4462,7 @@ function buildGeminiAuditPayload(rangeKey = 'week') {
   const streakInfo = computeActionStreakInfo();
   const g = appState.routineGoals || { dailyMinMins: 60, dailyIdealMins: 120, weeklyFreqDays: 6, sanctuary: 'Mi escritorio' };
 
-let report = `Actúa como mi Director de Operaciones de Estudio y Coach de Rendimiento Cognitivo (@hail-mary-study-coach). A continuación te pego la telemetría de mi Centro de Comando HAIL MARY correspondiente al período: ${periodLabel}.
+  let report = `Actúa como mi Director de Operaciones de Estudio y Coach de Rendimiento Cognitivo (@hail-mary-study-coach). A continuación te pego la telemetría de mi Centro de Comando HAIL MARY correspondiente al período: ${periodLabel}.
 Analiza mis datos y respóndeme con:
 1) Diagnóstico comparativo entre semanas (velocidad real vs. estimada y ratio Foco vs. Distracción),
 2) Detección de cuellos de botella o capítulos con riesgo antes del examen,
@@ -4490,10 +4490,10 @@ MEMORIA SEMANAL ACUMULADA:
 ${(appState.weeklyMemorySummary && appState.weeklyMemorySummary.trim()) ? appState.weeklyMemorySummary.trim() : '(Sin cierres semanales previos registrados)'}
 
 ACCIONES WEB YA APLICADAS (NO REPETIR):
-${appliedSigs.length > 0 ? appliedSigs.map(sig => `- ${sig}`).join('\\n') : '(Ninguna)'}
+${appliedSigs.length > 0 ? appliedSigs.map(sig => `- ${sig}`).join('\n') : '(Ninguna)'}
 
 CONSEJOS PERSONALES PENDIENTES:
-${pendingAdvice.length > 0 ? pendingAdvice.map(a => `- [${a.scope || 'general'}] ${a.text} (Motivo: ${a.reason || 'N/A'} | sig: ${a.signature})`).join('\\n') : '(Ninguno)'}
+${pendingAdvice.length > 0 ? pendingAdvice.map(a => `- [${a.scope || 'general'}] ${a.text} (Motivo: ${a.reason || 'N/A'} | sig: ${a.signature})`).join('\n') : '(Ninguno)'}
 
 DESGLOSE DE SESIONES DEL PERÍODO (${filteredLogs.length}):`;
   if (filteredLogs.length === 0) {
