@@ -7392,8 +7392,7 @@ function closeWeekAndSaveMemorySummary() {
   const newLine = `• [${rangeTag}] Foco: ${focusM}m | Distr: ${distM}m (${netPct}% neto) | Ritmo: ${avgPace}% | Fat/RPE: ${avgFat}/${avgRpe} | Consejos pend: ${pendAdvice}`;
 
   let prevLines = (appState.weeklyMemorySummary || '')
-    .split('
-')
+    .split('\n')
     .map(s => s.trim())
     .filter(Boolean);
   prevLines = prevLines.filter(l => !l.includes(`[${rangeTag}]`));
@@ -7407,8 +7406,7 @@ function closeWeekAndSaveMemorySummary() {
     ];
   }
 
-  appState.weeklyMemorySummary = prevLines.slice(0, 6).join('
-');
+  appState.weeklyMemorySummary = prevLines.slice(0, 6).join('\n');
   saveState();
   openExportGeminiModal();
   showToast('🔒 Semana cerrada y mini-resumen guardado en memoria (máx. 6 líneas).');
