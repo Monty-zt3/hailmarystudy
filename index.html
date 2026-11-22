@@ -4462,18 +4462,18 @@ function buildGeminiAuditPayload(rangeKey = 'week') {
   const streakInfo = computeActionStreakInfo();
   const g = appState.routineGoals || { dailyMinMins: 60, dailyIdealMins: 120, weeklyFreqDays: 6, sanctuary: 'Mi escritorio' };
 
-  let report = `Actúa como mi Director de Operaciones de Estudio y Coach de Rendimiento Cognitivo (@hail-mary-study-coach). A continuación te pego la telemetría de mi Centro de Comando HAIL MARY correspondiente al período: ${periodLabel}.
+let report = `Actúa como mi Director de Operaciones de Estudio y Coach de Rendimiento Cognitivo (@hail-mary-study-coach). A continuación te pego la telemetría de mi Centro de Comando HAIL MARY correspondiente al período: ${periodLabel}.
 Analiza mis datos y respóndeme con:
 1) Diagnóstico comparativo entre semanas (velocidad real vs. estimada y ratio Foco vs. Distracción),
 2) Detección de cuellos de botella o capítulos con riesgo antes del examen,
 3) Evaluación de mi fatiga/RPE, cumplimiento de racha y calidad de mis síntesis finales,
 4) Directrices tácticas accionables para optimizar mis bloques la próxima semana, y
-5) Al final de tu respuesta, incluye un bloque JSON válido (dentro de \`\`\`json ... \`\`\`) con el paquete dual exacto: { "weekSummary": "...", "webActions": [ { "signature": "...", "type": "...", "scope": "next_block" | "long_term", "topicId": "...", "subjectId": "...", "value": ... } ], "personalAdvice": [ { "signature": "...", "scope": "...", "text": "...", "reason": "..." } ] }.`
+5) Al final de tu respuesta, incluye un bloque JSON válido (dentro de \`\`\`json ... \`\`\`) con el paquete dual exacto: { "weekSummary": "...", "webActions": [ { "signature": "...", "type": "...", "scope": "next_block" | "long_term", "topicId": "...", "subjectId": "...", "value": ... } ], "personalAdvice": [ { "signature": "...", "scope": "...", "text": "...", "reason": "..." } ] }.
 
 --- TELEMETRÍA HAIL MARY (${periodLabel}) ---
-• Racha Actual ("Tomando Acción" ≥ ${g.dailyMinMins}m/día): ${streakInfo.streakDays} día(s) | Santuario: ${g.sanctuary}
-• Meta Diaria Mínima: ${g.dailyMinMins} min | Meta Ideal: ${g.dailyIdealMins} min (${g.weeklyFreqDays} días/sem)
-• Resumen del Período: ${uniqueDaysStudied} día(s) estudiados | ${filteredLogs.length} sesiones | Tiempo Enfocado: ${formatMinutesOrHours(totalFocusMins)} (${totalFocusMins}m) | Tiempo Distracción: ${formatMinutesOrHours(totalDistMins)} (${totalDistMins}m)
+- Racha Actual ("Tomando Acción" ≥ ${g.dailyMinMins}m/día): ${streakInfo.streakDays} día(s) | Santuario: ${g.sanctuary}
+- Meta Diaria Mínima: ${g.dailyMinMins} min | Meta Ideal: ${g.dailyIdealMins} min (${g.weeklyFreqDays} días/sem)
+- Resumen del Período: ${uniqueDaysStudied} día(s) estudiados | ${filteredLogs.length} sesiones | Tiempo Enfocado: ${formatMinutesOrHours(totalFocusMins)} (${totalFocusMins}m) | Tiempo Distracción: ${formatMinutesOrHours(totalDistMins)} (${totalDistMins}m)
 `;
 
   plan.urgencyMetrics.forEach(m => {
