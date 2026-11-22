@@ -2731,7 +2731,7 @@ function generateUnifiedPlan(overrideParams = null) {
       if (topic.status === 'Consolidado') {
         const baseDate = topic.consolidatedDate || today;
         [7, 14, 21].forEach((offset, idx) => {
-          var revNum = idx + 1;
+          const revNum = idx + 1;
           if (topic.reviewHistory && topic.reviewHistory.includes(revNum)) return;
           let targetDate = addDays(baseDate, offset);
           if (targetDate < today) targetDate = today;
