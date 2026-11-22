@@ -2104,7 +2104,12 @@ let appState = {
   geminiCustomStart: '',
   geminiCustomEnd: '',
   showDashboardMetrics: false,
-  showTacticalProjection: false
+  showTacticalProjection: false,
+  weeklyMemorySummary: '',
+  appliedWebActionSignatures: [],
+  personalAdviceList: [],
+  topicSessionOverrides: {},
+  lastWebActionSnapshot: null
 };
 
 let pendingImportPayload = null;
@@ -2145,7 +2150,12 @@ function loadState() {
         },
         geminiReportRange: parsed.geminiReportRange || 'week',
         geminiCustomStart: parsed.geminiCustomStart || '',
-        geminiCustomEnd: parsed.geminiCustomEnd || ''
+        geminiCustomEnd: parsed.geminiCustomEnd || '',
+        weeklyMemorySummary: typeof parsed.weeklyMemorySummary === 'string' ? parsed.weeklyMemorySummary : '',
+        appliedWebActionSignatures: Array.isArray(parsed.appliedWebActionSignatures) ? parsed.appliedWebActionSignatures : [],
+        personalAdviceList: Array.isArray(parsed.personalAdviceList) ? parsed.personalAdviceList : [],
+        topicSessionOverrides: (parsed.topicSessionOverrides && typeof parsed.topicSessionOverrides === 'object') ? parsed.topicSessionOverrides : {},
+        lastWebActionSnapshot: parsed.lastWebActionSnapshot || null
       };
     }
   } catch (e) {
@@ -2570,7 +2580,18 @@ function computeMicroBreakdown(totalMinutes, mode, startMin = null) {
   const activeTotal = Math.max(10, totalMinutes - priming - synthesis);
 
   let rawSegments = [];
-  if (mode === '3-tramos') {
+  if (mode === 'recuperacion') {
+    const p1 = Math.max(2, Math.round(totalMinutes * 0.10));
+    const p3 = Math.max(5, Math.round(totalMinutes * 0.40));
+    const pause = Math.max(3, Math.round(totalMinutes * 0.08));
+    const p2 = Math.max(5, totalMinutes - p1 - p3 - pause);
+    rawSegments = [
+      { label: '1. Priming Suave (10%)', mins: p1, type: 'priming' },
+      { label: '2. Foco Ligero (50%)', mins: p2, type: 'focus' },
+      { label: 'Pausa Descanso', mins: pause, type: 'pause' },
+      { label: '3. Síntesis & Repaso (40%)', mins: p3, type: 'synthesis' }
+    ];
+  } else if (mode === '3-tramos') {
     const p1 = Math.max(3, Math.round(totalMinutes * 0.06));
     const p2 = Math.max(3, Math.round(totalMinutes * 0.06));
     const workPool = Math.max(9, activeTotal - p1 - p2);
@@ -2700,13 +2721,26 @@ function generateUnifiedPlan(overrideParams = null) {
       const partialWorked = Math.max(0, topic.partialMinutesWorked || 0);
       const fullBlockMins = Math.round(subj.baseBlockMinutes * metric.speedMultiplier);
 
+      const topicOv = appState.topicSessionOverrides?.[topic.id] || null;
+
       for (let b = 0; b < remainingBlocks; b++) {
         const isFirstRemaining = b === 0 && partialWorked > 0;
-        const blockEstMins = isFirstRemaining
+        const appliesOverride = Boolean(
+          topicOv && (topicOv.scope === 'long_term' || (topicOv.scope === 'next_block' && b === 0))
+        );
+        const rawBlockEst = isFirstRemaining
           ? Math.max(15, fullBlockMins - partialWorked)
           : fullBlockMins;
+        const blockEstMins = appliesOverride && topicOv.totalMinutes
+          ? Math.max(15, parseInt(topicOv.totalMinutes, 10) || rawBlockEst)
+          : rawBlockEst;
 
         phase1Queue.push({
+          sessionOverride: appliesOverride ? {
+            scope: topicOv.scope,
+            mode: topicOv.mode || (topic.difficulty === 'Alta' ? '3-tramos' : '2-tramos'),
+            totalMinutes: blockEstMins
+          } : null,
           taskId: `${topic.id}_b_${topic.completedBlocks + b + 1}`,
           subjectId: subj.id,
           subjectName: subj.name,
@@ -3232,6 +3266,9 @@ function renderGlobalDashboard(plan) {
       </div>
     </div>
 
+    <!-- 2B. CONSEJOS PERSONALES ACTIVOS (CHECKLIST) -->
+    ${renderPersonalAdviceDashboardCard()}
+
     <!-- 3. PANEL PRINCIPAL DIRECTO: MISIÓN DE HOY (TARJETAS MINIMALISTAS) -->
     <div class="section-panel">
       <div class="section-header">
@@ -3376,7 +3413,7 @@ function renderGlobalDashboard(plan) {
 }
 
 function renderMissionCard(task, isOptional, slotIdx = 0) {
-  const cfg = appState.customSessionConfig[task.taskId] || suggestSessionFormat(task.difficulty);
+  const cfg = appState.customSessionConfig[task.taskId] || task.sessionOverride || suggestSessionFormat(task.difficulty);
   const totalMins = cfg.totalMinutes || task.allocatedMinutes || 90;
   const mode = cfg.mode || (task.difficulty === 'Alta' ? '3-tramos' : '2-tramos');
 
@@ -4051,6 +4088,7 @@ function submitCompleteSession(taskId, subjectId, topicId, phase) {
     if (!topic.reviewHistory.includes(revNum)) topic.reviewHistory.push(revNum);
   } else {
     topic.completedBlocks = Math.min(topic.estBlocks, topic.completedBlocks + 1);
+    consumeNextBlockTopicOverride(topic.id);
     if (topic.completedBlocks >= topic.estBlocks) {
       topic.status = 'Consolidado';
       topic.consolidatedDate = getTodayISO();
@@ -4376,6 +4414,7 @@ function openExportGeminiModal() {
       <button class="btn-gold" onclick="copyGeminiPrompt()">📋 Copiar Reporte del Período al Portapapeles</button>
     </div>
   `;
+  body.innerHTML += renderGeminiSkillWorkflowSection();
   document.getElementById('export-modal').classList.add('open');
 }
 
@@ -4425,10 +4464,11 @@ function buildGeminiAuditPayload(rangeKey = 'week') {
 
   let report = `Actúa como mi Director de Operaciones de Estudio y Coach de Rendimiento Cognitivo (@hail-mary-study-coach). A continuación te pego la telemetría de mi Centro de Comando HAIL MARY correspondiente al período: ${periodLabel}.
 Analiza mis datos y respóndeme con:
-1) Diagnóstico de velocidad real vs. estimada y ratio Foco vs. Distracción,
+1) Diagnóstico comparativo entre semanas (velocidad real vs. estimada y ratio Foco vs. Distracción),
 2) Detección de cuellos de botella o capítulos con riesgo antes del examen,
-3) Evaluación de mi fatiga/RPE, cumplimiento de racha y calidad de mis síntesis finales, y
-4) 3 directrices tácticas accionables para optimizar mis bloques la próxima semana.
+3) Evaluación de mi fatiga/RPE, cumplimiento de racha y calidad de mis síntesis finales,
+4) Directrices tácticas accionables para optimizar mis bloques la próxima semana, y
+5) Al final de tu respuesta, incluye un bloque JSON válido (dentro de \`\`\`json ... \`\`\`) con el paquete dual exacto: { "weekSummary": "...", "webActions": [ { "signature": "...", "type": "...", "scope": "next_block" | "long_term", "topicId": "...", "subjectId": "...", "value": ... } ], "personalAdvice": [ { "signature": "...", "scope": "...", "text": "...", "reason": "..." } ] }.`
 
 --- TELEMETRÍA HAIL MARY (${periodLabel}) ---
 • Racha Actual ("Tomando Acción" ≥ ${g.dailyMinMins}m/día): ${streakInfo.streakDays} día(s) | Santuario: ${g.sanctuary}
@@ -4441,7 +4481,21 @@ Analiza mis datos y respóndeme con:
 MATERIA: ${m.name} | Examen: ${m.examDate} (${m.daysLeft}d) | Progreso: ${m.completedBlocks}/${m.totalBlocks} blq | Factor Ritmo Real: ${Math.round(m.speedMultiplier * 100)}% | Cuota Híbrida: ${m.sharePercent}%`;
   });
 
+  const pendingAdvice = (appState.personalAdviceList || []).filter(a => !a.done);
+  const appliedSigs = appState.appliedWebActionSignatures || [];
+
   report += `
+
+MEMORIA SEMANAL ACUMULADA:
+${(appState.weeklyMemorySummary && appState.weeklyMemorySummary.trim()) ? appState.weeklyMemorySummary.trim() : '(Sin cierres semanales previos registrados)'}
+
+ACCIONES WEB YA APLICADAS (NO REPETIR):
+${appliedSigs.length > 0 ? appliedSigs.map(sig => `- ${sig}`).join('
+') : '(Ninguna)'}
+
+CONSEJOS PERSONALES PENDIENTES:
+${pendingAdvice.length > 0 ? pendingAdvice.map(a => `- [${a.scope || 'general'}] ${a.text} (Motivo: ${a.reason || 'N/A'} | sig: ${a.signature})`).join('
+') : '(Ninguno)'}
 
 DESGLOSE DE SESIONES DEL PERÍODO (${filteredLogs.length}):`;
   if (filteredLogs.length === 0) {
@@ -4482,7 +4536,15 @@ document.getElementById('json-file-input').addEventListener('change', async (e) 
     const text = await file.text();
     const parsed = JSON.parse(text);
     if (parsed && Array.isArray(parsed.subjects)) {
-      appState = { ...appState, ...parsed };
+      appState = {
+        ...appState,
+        ...parsed,
+        weeklyMemorySummary: typeof parsed.weeklyMemorySummary === 'string' ? parsed.weeklyMemorySummary : '',
+        appliedWebActionSignatures: Array.isArray(parsed.appliedWebActionSignatures) ? parsed.appliedWebActionSignatures : [],
+        personalAdviceList: Array.isArray(parsed.personalAdviceList) ? parsed.personalAdviceList : [],
+        topicSessionOverrides: (parsed.topicSessionOverrides && typeof parsed.topicSessionOverrides === 'object') ? parsed.topicSessionOverrides : {},
+        lastWebActionSnapshot: parsed.lastWebActionSnapshot || null
+      };
       saveState();
       applyTheme(appState.theme);
       closeModal('export-modal');
@@ -5539,6 +5601,7 @@ function submitStudyLogDrawer() {
       if (!topicObj.reviewHistory.includes(revNum)) topicObj.reviewHistory.push(revNum);
     } else {
       topicObj.completedBlocks = Math.min(topicObj.estBlocks, topicObj.completedBlocks + 1);
+      consumeNextBlockTopicOverride(topicObj.id);
       topicObj.partialMinutesWorked = 0;
       if (topicObj.completedBlocks >= topicObj.estBlocks) {
         topicObj.status = 'Consolidado';
@@ -5832,10 +5895,12 @@ function startMissionInFocusTimer(taskId) {
   const allToday = [...plan.todayTasks, ...plan.optionalTasks];
   const found = allToday.find(t => t.taskId === taskId);
   if (found) {
-    const cfg = appState.customSessionConfig[found.taskId] || suggestSessionFormat(found.difficulty);
+    const cfg = appState.customSessionConfig[found.taskId] || found.sessionOverride || suggestSessionFormat(found.difficulty);
     focusTimerState.selectedTarget = `task::${found.taskId}`;
     focusTimerState.totalMinutes = cfg.totalMinutes || found.allocatedMinutes || 90;
-    focusTimerState.scheme = cfg.mode === '3-tramos' ? '10-65-25-3t' : '10-65-25-2t';
+    focusTimerState.scheme = cfg.mode === 'recuperacion'
+      ? 'recuperacion'
+      : (cfg.mode === '3-tramos' ? '10-65-25-3t' : '10-65-25-2t');
     appState.activeFocusTaskId = taskId;
     initFocusTimerSequence(false);
   }
@@ -7205,6 +7270,494 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   }
 });
+</script>
+<script>
+
+function consumeNextBlockTopicOverride(topicId) {
+  if (!topicId || !appState.topicSessionOverrides) return;
+  const ov = appState.topicSessionOverrides[topicId];
+  if (ov && ov.scope === 'next_block') {
+    delete appState.topicSessionOverrides[topicId];
+  }
+}
+
+/* ==========================================================================
+   15. INTEGRACIÓN @hail-mary-study-coach (MEMORIA SEMANAL, JSON DUAL, REVERSIÓN)
+   ========================================================================== */
+let geminiParsedPreview = {
+  weekSummary: '',
+  webActions: [],
+  personalAdvice: [],
+  parseError: ''
+};
+
+function renderPersonalAdviceDashboardCard() {
+  const list = appState.personalAdviceList || [];
+  if (list.length === 0) return '';
+  const pendingCount = list.filter(item => !item.done).length;
+
+  return `
+    <div class="section-panel" id="personal-advice-card" style="border-left: 4px solid var(--accent-gold); margin-bottom:1.15rem;">
+      <div class="section-header" style="margin-bottom:0.75rem; padding-bottom:0.6rem;">
+        <div>
+          <h3 style="font-size:1rem;">🧠 Consejos Personales Activos (${pendingCount} pendiente(s) / ${list.length} total)</h3>
+          <span style="font-size:0.75rem; color:var(--text-secondary);">
+            Los ítems sin marcar permanecen pendientes y se envían automáticamente en el reporte de la próxima semana.
+          </span>
+        </div>
+        <button type="button" style="font-size:0.75rem; padding:0.32rem 0.65rem;" onclick="openExportGeminiModal()">
+          🤖 Gestionar Paquete Gemini
+        </button>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:0.5rem;">
+        ${list.map((item, idx) => {
+          const isDone = Boolean(item.done);
+          return `
+            <div style="background:var(--bg-elevated); border:1px solid var(--border-subtle); border-radius:8px; padding:0.65rem 0.85rem; display:flex; justify-content:space-between; align-items:flex-start; gap:0.75rem; flex-wrap:wrap; opacity:${isDone ? '0.65' : '1'};">
+              <div style="flex:1; min-width:220px;">
+                <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap; margin-bottom:0.2rem;">
+                  <span class="badge ${isDone ? 'badge-baja' : 'badge-media'}">${isDone ? '✓ Aplicado' : 'Pendiente'}</span>
+                  ${item.scope ? `<span class="time-slot-pill" style="font-size:0.7rem; padding:0.12rem 0.45rem;">${item.scope}</span>` : ''}
+                  ${item.addedDate ? `<span style="font-size:0.7rem; color:var(--text-muted);">${item.addedDate}</span>` : ''}
+                </div>
+                <div style="font-size:0.84rem; font-weight:700; color:var(--text-primary); ${isDone ? 'text-decoration:line-through;' : ''}">${item.text}</div>
+                ${item.reason ? `<div style="font-size:0.75rem; color:var(--text-secondary); margin-top:0.15rem;">Motivo: ${item.reason}</div>` : ''}
+              </div>
+              <div style="display:flex; gap:0.4rem; align-items:center;">
+                <button type="button" class="${isDone ? '' : 'btn-gold'}" style="padding:0.3rem 0.65rem; font-size:0.75rem;" onclick="togglePersonalAdviceDone(${idx})">
+                  ${isDone ? '↩️ Reabrir' : '✓ Aplicado / Entendido'}
+                </button>
+                <button type="button" class="btn-danger" style="padding:0.3rem 0.5rem; font-size:0.75rem;" title="Eliminar consejo" onclick="deletePersonalAdvice(${idx})">
+                  ✕
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function togglePersonalAdviceDone(idx) {
+  if (!Array.isArray(appState.personalAdviceList) || !appState.personalAdviceList[idx]) return;
+  appState.personalAdviceList[idx].done = !appState.personalAdviceList[idx].done;
+  saveState();
+  renderAll();
+  showToast(appState.personalAdviceList[idx].done ? '✓ Consejo marcado como aplicado.' : '↩️ Consejo marcado como pendiente.');
+}
+
+function deletePersonalAdvice(idx) {
+  if (!Array.isArray(appState.personalAdviceList) || !appState.personalAdviceList[idx]) return;
+  appState.personalAdviceList.splice(idx, 1);
+  saveState();
+  renderAll();
+  showToast('🗑️ Consejo personal eliminado.');
+}
+
+function closeWeekAndSaveMemorySummary() {
+  const rangeKey = appState.geminiReportRange || 'week';
+  const today = getTodayISO();
+  let startISO = addDays(today, -6);
+  let endISO = today;
+
+  if (rangeKey === 'today') {
+    startISO = today;
+  } else if (rangeKey === 'month') {
+    startISO = addDays(today, -29);
+  } else if (rangeKey === 'bimonth') {
+    startISO = addDays(today, -59);
+  } else if (rangeKey === 'custom') {
+    startISO = appState.geminiCustomStart || addDays(today, -14);
+    endISO = appState.geminiCustomEnd || today;
+  } else if (rangeKey === 'all') {
+    startISO = '2000-01-01';
+  }
+
+  const logs = appState.sessionLogs.filter(l => l.date >= startISO && l.date <= endISO);
+  const focusM = logs.reduce((a, l) => a + (l.actualMinutes || 0), 0);
+  const distM = logs.reduce((a, l) => a + (l.distractionMinutes || 0), 0);
+  const netPct = (focusM + distM) > 0 ? Math.round((focusM / (focusM + distM)) * 100) : 100;
+
+  const plan = generateUnifiedPlan();
+  const avgPace = plan.urgencyMetrics.length
+    ? Math.round((plan.urgencyMetrics.reduce((a, m) => a + m.speedMultiplier, 0) / plan.urgencyMetrics.length) * 100)
+    : 100;
+
+  const fatLogs = logs.filter(l => Number.isFinite(Number(l.fatigue)));
+  const rpeLogs = logs.filter(l => Number.isFinite(Number(l.rpe)));
+  const avgFat = fatLogs.length ? (fatLogs.reduce((a, l) => a + Number(l.fatigue), 0) / fatLogs.length).toFixed(1) : '-';
+  const avgRpe = rpeLogs.length ? (rpeLogs.reduce((a, l) => a + Number(l.rpe), 0) / rpeLogs.length).toFixed(1) : '-';
+  const pendAdvice = (appState.personalAdviceList || []).filter(a => !a.done).length;
+
+  const rangeTag = rangeKey === 'all' ? `Histórico..${today}` : `${startISO}..${endISO}`;
+  const newLine = `• [${rangeTag}] Foco: ${focusM}m | Distr: ${distM}m (${netPct}% neto) | Ritmo: ${avgPace}% | Fat/RPE: ${avgFat}/${avgRpe} | Consejos pend: ${pendAdvice}`;
+
+  let prevLines = (appState.weeklyMemorySummary || '')
+    .split('
+')
+    .map(s => s.trim())
+    .filter(Boolean);
+  prevLines = prevLines.filter(l => !l.includes(`[${rangeTag}]`));
+  prevLines.push(newLine);
+
+  if (prevLines.length > 6) {
+    const overflowCount = prevLines.length - 5;
+    prevLines = [
+      `• [Acumulado previo] ${overflowCount} cierre(s) comprimidos en historial.`,
+      ...prevLines.slice(-5)
+    ];
+  }
+
+  appState.weeklyMemorySummary = prevLines.slice(0, 6).join('
+');
+  saveState();
+  openExportGeminiModal();
+  showToast('🔒 Semana cerrada y mini-resumen guardado en memoria (máx. 6 líneas).');
+}
+
+function extractGeminiJsonPackage(rawText) {
+  if (!rawText || !rawText.trim()) {
+    return { weekSummary: '', webActions: [], personalAdvice: [], parseError: '' };
+  }
+
+  const fencedMatch = rawText.match(/```json\s*([\s\S]*?)```/i) || rawText.match(/```\s*([\s\S]*?)```/i);
+  let candidate = fencedMatch ? fencedMatch[1].trim() : rawText.trim();
+
+  if (!fencedMatch) {
+    const firstBrace = candidate.indexOf('{');
+    const lastBrace = candidate.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      candidate = candidate.slice(firstBrace, lastBrace + 1);
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(candidate);
+    const webActions = Array.isArray(parsed.webActions) ? parsed.webActions.map((act, i) => {
+      const scope = act.scope === 'long_term' ? 'long_term' : 'next_block';
+      const type = act.type || 'set_topic_recovery';
+      const topicId = act.topicId || '';
+      const subjectId = act.subjectId || '';
+      const value = act.value !== undefined ? act.value : '';
+      const signature = act.signature || `${type}::${topicId || subjectId || 'global'}::${scope}::${String(value)}`;
+      return {
+        signature,
+        type,
+        scope,
+        topicId,
+        subjectId,
+        value,
+        label: act.label || `${type} (${topicId || subjectId || 'general'}) = ${String(value)}`
+      };
+    }) : [];
+
+    const existingSigs = new Set((appState.personalAdviceList || []).map(p => p.signature));
+    const existingTexts = new Set((appState.personalAdviceList || []).map(p => (p.text || '').trim().toLowerCase()));
+
+    const personalAdvice = Array.isArray(parsed.personalAdvice) ? parsed.personalAdvice
+      .map((adv, i) => {
+        const text = String(adv.text || adv.advice || '').trim();
+        const reason = String(adv.reason || '').trim();
+        const scope = String(adv.scope || 'semana').trim();
+        const signature = adv.signature || `advice::${scope}::${text.slice(0, 40)}`;
+        return { signature, scope, text, reason };
+      })
+      .filter(adv => adv.text && !existingSigs.has(adv.signature) && !existingTexts.has(adv.text.toLowerCase()))
+      : [];
+
+    return {
+      weekSummary: typeof parsed.weekSummary === 'string' ? parsed.weekSummary.trim() : '',
+      webActions,
+      personalAdvice,
+      parseError: ''
+    };
+  } catch (err) {
+    return {
+      weekSummary: '',
+      webActions: [],
+      personalAdvice: [],
+      parseError: `No se pudo interpretar un bloque JSON válido: ${err.message}`
+    };
+  }
+}
+
+function handleGeminiPackageInput(val) {
+  geminiParsedPreview = extractGeminiJsonPackage(val);
+  renderGeminiPackagePreviewBox();
+}
+
+function renderGeminiPackagePreviewBox() {
+  const box = document.getElementById('gemini-package-preview-box');
+  if (!box) return;
+
+  const { weekSummary, webActions, personalAdvice, parseError } = geminiParsedPreview;
+  const appliedSet = new Set(appState.appliedWebActionSignatures || []);
+
+  if (parseError) {
+    box.innerHTML = `<div class="alert-banner" style="margin-bottom:0;">⚠️ ${parseError}</div>`;
+    return;
+  }
+
+  if (webActions.length === 0 && personalAdvice.length === 0 && !weekSummary) {
+    box.innerHTML = `<div style="font-size:0.77rem; color:var(--text-muted);">Pega arriba la respuesta de Gemini con el bloque JSON para inspeccionar acciones y consejos.</div>`;
+    return;
+  }
+
+  box.innerHTML = `
+    ${weekSummary ? `
+      <div style="background:var(--bg-card); border:1px solid var(--border-subtle); border-radius:8px; padding:0.65rem 0.8rem; margin-bottom:0.75rem; font-size:0.78rem;">
+        <strong style="color:var(--accent-gold);">📋 Resumen Semanal detectado:</strong> ${weekSummary}
+      </div>
+    ` : ''}
+
+    <div style="margin-bottom:0.85rem;">
+      <div style="font-size:0.78rem; font-weight:800; color:var(--accent-orange); margin-bottom:0.4rem;">
+        ⚙️ Acciones para la Web (webActions) (${webActions.length})
+      </div>
+      ${webActions.length === 0 ? `<div style="font-size:0.76rem; color:var(--text-muted);">Sin acciones web en el JSON.</div>` : `
+        <div style="display:flex; flex-direction:column; gap:0.4rem;">
+          ${webActions.map((act, idx) => {
+            const alreadyApplied = appliedSet.has(act.signature);
+            const scopeBadge = act.scope === 'long_term'
+              ? `<span class="badge badge-media">📌 Largo plazo</span>`
+              : `<span class="time-slot-pill" style="font-size:0.7rem; padding:0.12rem 0.45rem;">⚡ Próximo bloque</span>`;
+            return `
+              <label style="display:flex; align-items:flex-start; gap:0.55rem; background:var(--bg-card); border:1px solid var(--border-subtle); border-radius:7px; padding:0.55rem 0.75rem; cursor:${alreadyApplied ? 'not-allowed' : 'pointer'}; opacity:${alreadyApplied ? '0.6' : '1'};">
+                <input type="checkbox" class="gem-web-action-cb" data-idx="${idx}" ${alreadyApplied ? 'disabled' : 'checked'} style="margin-top:0.2rem;" />
+                <div style="flex:1; font-size:0.79rem;">
+                  <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;">
+                    ${scopeBadge}
+                    ${alreadyApplied ? `<span class="badge badge-baja">✓ Ya aplicada</span>` : ''}
+                    <strong style="color:var(--text-primary);">${act.label}</strong>
+                  </div>
+                  <div style="font-size:0.71rem; color:var(--text-muted); margin-top:0.15rem;">Firma: <code>${act.signature}</code></div>
+                </div>
+              </label>
+            `;
+          }).join('')}
+        </div>
+      `}
+    </div>
+
+    <div>
+      <div style="font-size:0.78rem; font-weight:800; color:var(--accent-gold); margin-bottom:0.4rem;">
+        🧠 Consejos para Ti (personalAdvice) (${personalAdvice.length})
+      </div>
+      ${personalAdvice.length === 0 ? `<div style="font-size:0.76rem; color:var(--text-muted);">Sin consejos personales nuevos en el JSON.</div>` : `
+        <div style="display:flex; flex-direction:column; gap:0.4rem;">
+          ${personalAdvice.map((adv, idx) => `
+            <label style="display:flex; align-items:flex-start; gap:0.55rem; background:var(--bg-card); border:1px solid var(--border-subtle); border-radius:7px; padding:0.55rem 0.75rem; cursor:pointer;">
+              <input type="checkbox" class="gem-personal-advice-cb" data-idx="${idx}" checked style="margin-top:0.2rem;" />
+              <div style="flex:1; font-size:0.79rem;">
+                <div style="font-weight:700; color:var(--text-primary);">${adv.text}</div>
+                ${adv.reason ? `<div style="font-size:0.73rem; color:var(--text-secondary);">Motivo: ${adv.reason}</div>` : ''}
+              </div>
+            </label>
+          `).join('')}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+function findTopicAndSubjectByIds(subjectId, topicId) {
+  for (const s of appState.subjects) {
+    if (subjectId && s.id !== subjectId && s.name.toLowerCase() !== String(subjectId).toLowerCase()) continue;
+    if (topicId) {
+      const t = s.topics.find(x => x.id === topicId || x.title.toLowerCase().includes(String(topicId).toLowerCase()));
+      if (t) return { subj: s, topic: t };
+    }
+  }
+  if (topicId) {
+    for (const s of appState.subjects) {
+      const t = s.topics.find(x => x.id === topicId || x.title.toLowerCase().includes(String(topicId).toLowerCase()));
+      if (t) return { subj: s, topic: t };
+    }
+  }
+  return null;
+}
+
+function applySelectedGeminiPackage() {
+  const rawInput = document.getElementById('gemini-package-input')?.value || '';
+  if (rawInput.trim()) {
+    geminiParsedPreview = extractGeminiJsonPackage(rawInput);
+  }
+
+  const selectedWebIndices = Array.from(document.querySelectorAll('.gem-web-action-cb:checked:not(:disabled)'))
+    .map(cb => parseInt(cb.getAttribute('data-idx'), 10));
+  const selectedAdviceIndices = Array.from(document.querySelectorAll('.gem-personal-advice-cb:checked'))
+    .map(cb => parseInt(cb.getAttribute('data-idx'), 10));
+
+  if (selectedWebIndices.length === 0 && selectedAdviceIndices.length === 0) {
+    showToast('⚠️ No hay acciones o consejos seleccionados para aplicar.');
+    return;
+  }
+
+  // Guardar snapshot previo para permitir revertir con un clic
+  appState.lastWebActionSnapshot = JSON.parse(JSON.stringify({
+    subjects: appState.subjects,
+    routineGoals: appState.routineGoals,
+    todayTopicOverrides: appState.todayTopicOverrides,
+    topicSessionOverrides: appState.topicSessionOverrides,
+    customSessionConfig: appState.customSessionConfig,
+    appliedWebActionSignatures: appState.appliedWebActionSignatures,
+    personalAdviceList: appState.personalAdviceList,
+    weeklyMemorySummary: appState.weeklyMemorySummary
+  }));
+
+  if (!Array.isArray(appState.appliedWebActionSignatures)) appState.appliedWebActionSignatures = [];
+  if (!Array.isArray(appState.personalAdviceList)) appState.personalAdviceList = [];
+  if (!appState.topicSessionOverrides) appState.topicSessionOverrides = {};
+  if (!appState.todayTopicOverrides) appState.todayTopicOverrides = {};
+
+  const appliedSet = new Set(appState.appliedWebActionSignatures);
+  const today = getTodayISO();
+  let executedCount = 0;
+
+  selectedWebIndices.forEach(idx => {
+    const act = geminiParsedPreview.webActions[idx];
+    if (!act || appliedSet.has(act.signature)) return;
+
+    const scope = act.scope === 'long_term' ? 'long_term' : 'next_block';
+    const match = findTopicAndSubjectByIds(act.subjectId, act.topicId);
+
+    if (act.type === 'set_topic_recovery') {
+      if (match) {
+        appState.topicSessionOverrides[match.topic.id] = {
+          scope,
+          mode: 'recuperacion',
+          totalMinutes: 90
+        };
+      }
+    } else if (act.type === 'set_topic_duration') {
+      const minsVal = Math.max(15, parseInt(act.value, 10) || 90);
+      if (match) {
+        const prev = appState.topicSessionOverrides[match.topic.id] || {};
+        appState.topicSessionOverrides[match.topic.id] = {
+          scope,
+          mode: prev.mode || (match.topic.difficulty === 'Alta' ? '3-tramos' : '2-tramos'),
+          totalMinutes: minsVal
+        };
+      }
+    } else if (act.type === 'add_topic_blocks') {
+      const inc = Math.min(1, Math.max(1, parseInt(act.value, 10) || 1));
+      if (match) {
+        match.topic.estBlocks = (match.topic.estBlocks || 1) + inc;
+        if (match.topic.status === 'Consolidado') {
+          match.topic.status = 'En proceso';
+          match.topic.consolidatedDate = null;
+        }
+      }
+    } else if (act.type === 'schedule_extra_review') {
+      if (match) {
+        if (!appState.todayTopicOverrides[today]) appState.todayTopicOverrides[today] = {};
+        const nextSlotIdx = Object.keys(appState.todayTopicOverrides[today]).length;
+        appState.todayTopicOverrides[today][nextSlotIdx] = {
+          subjectId: match.subj.id,
+          topicId: match.topic.id
+        };
+      }
+    } else if (act.type === 'update_routine_goal') {
+      const newMin = Math.max(10, parseInt(act.value, 10) || appState.routineGoals.dailyMinMins);
+      appState.routineGoals.dailyMinMins = newMin;
+    }
+
+    appliedSet.add(act.signature);
+    executedCount++;
+  });
+
+  appState.appliedWebActionSignatures = Array.from(appliedSet);
+
+  let adviceAdded = 0;
+  selectedAdviceIndices.forEach(idx => {
+    const adv = geminiParsedPreview.personalAdvice[idx];
+    if (!adv || !adv.text) return;
+    appState.personalAdviceList.push({
+      signature: adv.signature,
+      scope: adv.scope || 'semana',
+      text: adv.text,
+      reason: adv.reason || '',
+      done: false,
+      addedDate: today
+    });
+    adviceAdded++;
+  });
+
+  saveState();
+  openExportGeminiModal();
+  renderAll();
+  showToast(`✅ Aplicadas ${executedCount} acción(es) web y ${adviceAdded} consejo(s). Plan recalculado.`);
+}
+
+function undoLastWebActionBatch() {
+  if (!appState.lastWebActionSnapshot) {
+    showToast('No hay ningún lote previo para deshacer.');
+    return;
+  }
+  const snap = appState.lastWebActionSnapshot;
+  appState.subjects = snap.subjects;
+  appState.routineGoals = snap.routineGoals;
+  appState.todayTopicOverrides = snap.todayTopicOverrides;
+  appState.topicSessionOverrides = snap.topicSessionOverrides;
+  appState.customSessionConfig = snap.customSessionConfig;
+  appState.appliedWebActionSignatures = snap.appliedWebActionSignatures;
+  appState.personalAdviceList = snap.personalAdviceList;
+  appState.weeklyMemorySummary = snap.weeklyMemorySummary;
+  appState.lastWebActionSnapshot = null;
+
+  saveState();
+  openExportGeminiModal();
+  renderAll();
+  showToast('↩️ Último lote de recomendaciones revertido.');
+}
+
+function renderGeminiSkillWorkflowSection() {
+  const memText = (appState.weeklyMemorySummary && appState.weeklyMemorySummary.trim())
+    ? appState.weeklyMemorySummary.trim()
+    : 'Aún no has cerrado ninguna semana en memoria.';
+
+  return `
+    <div style="margin-top:1.25rem; padding-top:1.1rem; border-top:1px solid var(--border-subtle);">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.7rem;">
+        <div>
+          <strong style="font-size:0.88rem; color:var(--accent-gold); display:block;">🧠 Memoria Semanal Acumulada (Máx. 6 líneas)</strong>
+          <span style="font-size:0.74rem; color:var(--text-secondary);">Se incluye automáticamente en el reporte para comparar semanas con @hail-mary-study-coach</span>
+        </div>
+        <button type="button" class="btn-gold" style="font-size:0.78rem; padding:0.38rem 0.75rem;" onclick="closeWeekAndSaveMemorySummary()">
+          🔒 Cerrar semana y guardar mini-resumen en memoria
+        </button>
+      </div>
+      <pre style="background:var(--bg-elevated); border:1px solid var(--border-subtle); border-radius:8px; padding:0.65rem 0.8rem; font-size:0.75rem; color:var(--text-primary); white-space:pre-wrap; margin-bottom:1.15rem;">${memText}</pre>
+
+      <div style="background:var(--bg-elevated); border:1px solid var(--border-strong); border-radius:10px; padding:0.95rem 1.05rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.55rem;">
+          <strong style="font-size:0.9rem; color:var(--accent-solar);">📥 Aplicar Paquete de Gemini</strong>
+          ${appState.lastWebActionSnapshot ? `
+            <button type="button" class="btn-danger" style="font-size:0.76rem; padding:0.32rem 0.7rem;" onclick="undoLastWebActionBatch()">
+              ↩️ Deshacer último lote aplicado
+            </button>
+          ` : ''}
+        </div>
+        <p style="font-size:0.76rem; color:var(--text-secondary); margin-bottom:0.55rem;">
+          Pega aquí la respuesta de Gemini (con o sin bloque \`\`\`json ... \`\`\`). Selecciona de forma independiente qué acciones web ejecutar y qué consejos personales guardar:
+        </p>
+        <textarea id="gemini-package-input" rows="5" style="width:100%; font-family:monospace; font-size:0.76rem; margin-bottom:0.7rem;" placeholder='Pega aquí la respuesta de Gemini que contenga {"weekSummary": "...", "webActions": [...], "personalAdvice": [...]}' oninput="handleGeminiPackageInput(this.value)"></textarea>
+
+        <div id="gemini-package-preview-box" style="margin-bottom:0.8rem;">
+          <div style="font-size:0.77rem; color:var(--text-muted);">Pega arriba la respuesta de Gemini con el bloque JSON para inspeccionar acciones y consejos.</div>
+        </div>
+
+        <div style="display:flex; justify-content:flex-end; gap:0.55rem; flex-wrap:wrap;">
+          <button type="button" class="btn-primary" onclick="applySelectedGeminiPackage()">
+            ✅ Aplicar seleccionados y recalcular
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 </script>
 </body>
 </html>
