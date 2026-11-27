@@ -1612,7 +1612,7 @@
       <div>
         <div style="display:flex; align-items:center; gap:0.45rem; margin-bottom:0.2rem;">
           <span class="time-slot-pill" id="sd-header-date-badge">HOY</span>
-          <span style="font-size:0.74rem; color:var(--text-secondary); font-weight:700; text-transform:uppercase;">Bitácora de Estudio 10 / 65 / 25</span>
+          <span style="font-size:0.74rem; color:var(--text-secondary); font-weight:700; text-transform:uppercase;">Bitácora de Estudio (5m Priming • 5m Pausa • 25m Síntesis)</span>
         </div>
         <h3 style="font-size:1.12rem; font-weight:800;" id="sd-drawer-title">Registrar Sesión de Estudio</h3>
       </div>
@@ -2574,51 +2574,198 @@ function suggestSessionFormat(difficulty) {
   return { totalMinutes: 45, mode: '2-tramos' };
 }
 
-function computeMicroBreakdown(totalMinutes, mode, startMin = null) {
-  const priming = Math.round(totalMinutes * 0.10);
-  const synthesis = Math.round(totalMinutes * 0.25);
-  const activeTotal = Math.max(10, totalMinutes - priming - synthesis);
+function computeResistanceStats(startISO = null, endISO = null) {
+  const recList = Array.isArray(appState.resistanceRecords) ? appState.resistanceRecords : [];
+  const filteredRec = recList.filter(r => {
+    const m = Number(r.minutesEndured);
+    if (!Number.isFinite(m) || m <= 0) return false;
+    if (startISO && r.date < startISO) return false;
+    if (endISO && r.date > endISO) return false;
+    return true;
+  });
+
+  const recValues = filteredRec.map(r => Number(r.minutesEndured));
+  const logValues = (appState.sessionLogs || [])
+    .filter(l => {
+      if (startISO && l.date < startISO) return false;
+      if (endISO && l.date > endISO) return false;
+      return (Number(l.distractionMinutes) || 0) > 0 && (Number(l.actualMinutes) || 0) > 0;
+    })
+    .map(l => {
+      const act = Number(l.actualMinutes) || 0;
+      const dist = Number(l.distractionMinutes) || 0;
+      return Math.max(5, Math.round(act / (1 + dist / 15)));
+    });
+
+  const combined = [...recValues, ...logValues];
+  const cutsCount = filteredRec.length + (appState.sessionLogs || []).filter(l => {
+    if (startISO && l.date < startISO) return false;
+    if (endISO && l.date > endISO) return false;
+    return (Number(l.distractionMinutes) || 0) > 0;
+  }).length;
+
+  if (combined.length === 0) {
+    return { min: null, avg: null, max: null, count: 0, cutsCount };
+  }
+  const min = Math.min(...combined);
+  const max = Math.max(...combined);
+  const avg = Math.round(combined.reduce((a, b) => a + b, 0) / combined.length);
+  return { min, avg, max, count: combined.length, cutsCount };
+}
+
+function splitFocusPoolByThreshold(focusPoolMins, isLongSession, thresholdAvg) {
+  const pool = Math.max(5, Math.round(focusPoolMins));
+  const pauseMins = isLongSession ? 8 : 5;
+  const maxChunk = (thresholdAvg && Number.isFinite(thresholdAvg) && thresholdAvg >= 8)
+    ? Math.max(8, Math.round(thresholdAvg))
+    : null;
+
+  let chunks = [];
+  if (!maxChunk || pool <= maxChunk) {
+    if (!isLongSession && pool >= 22) {
+      const t1 = Math.max(8, Math.round(pool * 0.58));
+      const t2 = Math.max(5, pool - t1);
+      chunks = [t1, t2];
+    } else if (isLongSession && pool >= 36) {
+      const t1 = Math.max(10, Math.round(pool * 0.40));
+      const t2 = Math.max(10, Math.round(pool * 0.32));
+      const t3 = Math.max(8, pool - t1 - t2);
+      chunks = [t1, t2, t3];
+    } else {
+      chunks = [pool];
+    }
+  } else {
+    let rem = pool;
+    while (rem > 0) {
+      if (rem <= maxChunk) {
+        chunks.push(rem);
+        rem = 0;
+      } else if (rem - maxChunk < 6 && chunks.length > 0) {
+        const half = Math.max(6, Math.round((rem + chunks[chunks.length - 1]) / 2));
+        chunks[chunks.length - 1] = half;
+        chunks.push(Math.max(5, (rem + maxChunk) - half));
+        rem = 0;
+      } else {
+        chunks.push(maxChunk);
+        rem -= maxChunk;
+      }
+    }
+  }
+
+  // Intercalar pausas internas (5m estándar / 8m en >= 120m) manteniendo la suma total de minutos exacta
+  const built = [];
+  chunks.forEach((cMins, idx) => {
+    const labelSuffix = chunks.length > 1
+      ? (idx === 0 ? 'Foco Máx' : (idx === chunks.length - 1 ? 'Cierre' : 'Sostén'))
+      : 'Asimilación';
+    built.push({ label: `Tramo ${idx + 1} • ${labelSuffix}`, mins: cMins, type: 'focus' });
+    if (idx < chunks.length - 1) {
+      built.push({
+        label: isLongSession ? 'Pausa Profunda (8m)' : 'Pausa Sin Pantallas (5m)',
+        mins: pauseMins,
+        type: 'pause'
+      });
+    }
+  });
+  return built;
+}
+
+function computeMicroBreakdown(totalMinutes, mode, startMin = null, opts = {}) {
+  const total = Math.max(10, Math.round(Number(totalMinutes) || 90));
+  const isLongSession = total >= 120 || mode === '3-tramos';
+  const resStats = computeResistanceStats();
+  const thresholdAvg = opts.thresholdAvg !== undefined ? opts.thresholdAvg : resStats.avg;
+
+  // 1. Priming fijo de 5 min (escala proporcionalmente si total < 45 min)
+  const priming = total < 45
+    ? Math.max(2, Math.round((5 / 45) * total))
+    : 5;
+
+  // 2. Pausa vital fija de 5 min antes de la Síntesis
+  const vitalPause = total < 30 ? 2 : 5;
+
+  // 3. Síntesis Propia fija de 25 min (o 30-35 min en modo recuperación)
+  let synthesis = total < 45
+    ? Math.max(5, Math.round((25 / 45) * total))
+    : 25;
+  if (mode === 'recuperacion') {
+    synthesis = total >= 120 ? 35 : 30;
+  }
 
   let rawSegments = [];
   if (mode === 'recuperacion') {
-    const p1 = Math.max(2, Math.round(totalMinutes * 0.10));
-    const p3 = Math.max(5, Math.round(totalMinutes * 0.40));
-    const pause = Math.max(3, Math.round(totalMinutes * 0.08));
-    const p2 = Math.max(5, totalMinutes - p1 - p3 - pause);
+    const minFocus = Math.max(5, total - priming - vitalPause - synthesis);
+    const focusCap = thresholdAvg ? Math.min(minFocus, Math.max(8, thresholdAvg)) : minFocus;
+    const focusMins = Math.max(5, Math.min(minFocus, focusCap));
+    const extraBuffer = Math.max(0, total - (priming + focusMins + vitalPause + synthesis));
     rawSegments = [
-      { label: '1. Priming Suave (10%)', mins: p1, type: 'priming' },
-      { label: '2. Foco Ligero (50%)', mins: p2, type: 'focus' },
-      { label: 'Pausa Descanso', mins: pause, type: 'pause' },
-      { label: '3. Síntesis & Repaso (40%)', mins: p3, type: 'synthesis' }
-    ];
-  } else if (mode === '3-tramos') {
-    const p1 = Math.max(3, Math.round(totalMinutes * 0.06));
-    const p2 = Math.max(3, Math.round(totalMinutes * 0.06));
-    const workPool = Math.max(9, activeTotal - p1 - p2);
-    const t1 = Math.round(workPool * 0.40);
-    const t2 = Math.round(workPool * 0.33);
-    const t3 = Math.max(3, workPool - t1 - t2);
-    rawSegments = [
-      { label: '1. Priming (10%)', mins: priming, type: 'priming' },
-      { label: '2. Tramo 1 • Foco Máx', mins: t1, type: 'focus' },
-      { label: 'Pausa Sin Pantallas', mins: p1, type: 'pause' },
-      { label: '3. Tramo 2 • Sostén', mins: t2, type: 'focus' },
-      { label: 'Pausa Sin Pantallas', mins: p2, type: 'pause' },
-      { label: '4. Tramo 3 • Cierre', mins: t3, type: 'focus' },
-      { label: '5. Síntesis Propia (25%)', mins: synthesis, type: 'synthesis' }
+      { label: '1. Priming Fijo (5m)', mins: priming, type: 'priming' },
+      { label: '2. Foco Suave (Recuperación)', mins: focusMins, type: 'focus' },
+      { label: `Pausa Vital (${vitalPause}m)`, mins: vitalPause, type: 'pause' },
+      { label: `3. Síntesis Propia (${synthesis}m)`, mins: synthesis + extraBuffer, type: 'synthesis' }
     ];
   } else {
-    const pause = Math.max(3, Math.round(totalMinutes * 0.08));
-    const workPool = Math.max(6, activeTotal - pause);
-    const t1 = Math.round(workPool * 0.67);
-    const t2 = Math.max(3, workPool - t1);
-    rawSegments = [
-      { label: '1. Priming (10%)', mins: priming, type: 'priming' },
-      { label: '2. Tramo 1 • Asimilación', mins: t1, type: 'focus' },
-      { label: 'Pausa Sin Pantallas', mins: pause, type: 'pause' },
-      { label: '3. Tramo 2 • Foco', mins: t2, type: 'focus' },
-      { label: '4. Síntesis Propia (25%)', mins: synthesis, type: 'synthesis' }
-    ];
+    const fixedOverhead = priming + vitalPause + synthesis;
+    if (total <= fixedOverhead + 5) {
+      const fMins = Math.max(5, total - priming - synthesis);
+      rawSegments = [
+        { label: `1. Priming (${priming}m)`, mins: priming, type: 'priming' },
+        { label: '2. Foco Activo', mins: fMins, type: 'focus' },
+        { label: `3. Síntesis Propia (${synthesis}m)`, mins: synthesis, type: 'synthesis' }
+      ];
+    } else {
+      const availableForFocusAndInternalPauses = total - fixedOverhead;
+      const pauseUnit = isLongSession ? 8 : 5;
+      let focusSequence = splitFocusPoolByThreshold(availableForFocusAndInternalPauses, isLongSession, thresholdAvg);
+
+      // Ajustar pausas internas si la suma excede el pool disponible
+      let sumDur = focusSequence.reduce((a, x) => a + x.mins, 0);
+      while (sumDur > availableForFocusAndInternalPauses && focusSequence.some(x => x.type === 'pause')) {
+        const lastPauseIdx = focusSequence.map(x => x.type).lastIndexOf('pause');
+        if (lastPauseIdx >= 0) {
+          focusSequence.splice(lastPauseIdx, 1);
+          // Reconstruir tramos de foco con el nuevo pool sin esa pausa
+          const focusOnlyMins = focusSequence.filter(x => x.type === 'focus').reduce((a, x) => a + x.mins, 0);
+          const pausedCount = focusSequence.filter(x => x.type === 'pause').length;
+          const targetFocusSum = Math.max(5, availableForFocusAndInternalPauses - (pausedCount * pauseUnit));
+          const ratio = focusOnlyMins > 0 ? (targetFocusSum / focusOnlyMins) : 1;
+          let accF = 0;
+          const fItems = focusSequence.filter(x => x.type === 'focus');
+          fItems.forEach((fItem, i) => {
+            if (i < fItems.length - 1) {
+              fItem.mins = Math.max(5, Math.round(fItem.mins * ratio));
+              accF += fItem.mins;
+            } else {
+              fItem.mins = Math.max(5, targetFocusSum - accF);
+            }
+          });
+        }
+        sumDur = focusSequence.reduce((a, x) => a + x.mins, 0);
+      }
+
+      // Cuadrar exactitud de minutos totales con el tramo de foco principal/último
+      const diffTotal = availableForFocusAndInternalPauses - sumDur;
+      if (diffTotal !== 0 && focusSequence.length > 0) {
+        const lastFocusIdx = focusSequence.map(x => x.type).lastIndexOf('focus');
+        if (lastFocusIdx >= 0) {
+          focusSequence[lastFocusIdx].mins = Math.max(5, focusSequence[lastFocusIdx].mins + diffTotal);
+        }
+      }
+
+      const numberedFocus = focusSequence.map((item, idx) => {
+        if (item.type === 'focus') {
+          return { ...item, label: `${idx + 2}. ${item.label}` };
+        }
+        return item;
+      });
+
+      rawSegments = [
+        { label: `1. Priming Fijo (${priming}m)`, mins: priming, type: 'priming' },
+        ...numberedFocus,
+        { label: `Pausa Vital (${vitalPause}m)`, mins: vitalPause, type: 'pause' },
+        { label: `Síntesis Propia (${synthesis}m)`, mins: synthesis, type: 'synthesis' }
+      ];
+    }
   }
 
   let cursor = startMin;
@@ -2633,7 +2780,7 @@ function computeMicroBreakdown(totalMinutes, mode, startMin = null) {
     return { ...seg, clockRange };
   });
 
-  return { priming, synthesis, segments };
+  return { priming, vitalPause, synthesis, segments, resistanceStats: resStats };
 }
 
 /* ==========================================================================
@@ -4473,7 +4620,12 @@ Analiza mis datos y respóndeme con:
 --- TELEMETRÍA HAIL MARY (${periodLabel}) ---
 - Racha Actual ("Tomando Acción" ≥ ${g.dailyMinMins}m/día): ${streakInfo.streakDays} día(s) | Santuario: ${g.sanctuary}
 - Meta Diaria Mínima: ${g.dailyMinMins} min | Meta Ideal: ${g.dailyIdealMins} min (${g.weeklyFreqDays} días/sem)
-- Resumen del Período: ${uniqueDaysStudied} día(s) estudiados | ${filteredLogs.length} sesiones | Tiempo Enfocado: ${formatMinutesOrHours(totalFocusMins)} (${totalFocusMins}m) | Tiempo Distracción: ${formatMinutesOrHours(totalDistMins)} (${totalDistMins}m)
+${(() => {
+  const rStats = computeResistanceStats(startISO, endISO);
+  const rStr = rStats.count > 0 ? `${rStats.min}m / ${rStats.avg}m / ${rStats.max}m` : 'Sin datos';
+  return `- Resumen del Período: ${uniqueDaysStudied} día(s) estudiados | ${filteredLogs.length} sesiones | Tiempo Enfocado: ${formatMinutesOrHours(totalFocusMins)} (${totalFocusMins}m) | Tiempo Distracción: ${formatMinutesOrHours(totalDistMins)} (${totalDistMins}m)
+- Umbral de Resistencia Cognitiva (Mín / Promedio / Máx): ${rStr} | Cortes por desconcentración en el período: ${rStats.cutsCount}`;
+})()}
 `;
 
   plan.urgencyMetrics.forEach(m => {
@@ -5030,20 +5182,20 @@ function openStudyLogDrawer(prefill = {}) {
         <span style="font-size:0.75rem; font-weight:800; text-transform:uppercase; color:var(--accent-gold);">
           Tipo de Distribución del Horario Utilizado
         </span>
-        <span class="time-slot-pill" id="sd-dist-badge">10% / 65% / 25%</span>
+        <span class="time-slot-pill" id="sd-dist-badge">5m • Foco • 5m • 25m</span>
       </div>
 
       <div class="dist-preset-grid" id="sd-dist-grid">
         <div class="dist-option-card ${initialDist === '10-65-25-2t' ? 'selected' : ''}" data-dist="10-65-25-2t" onclick="selectStudyDistribution('10-65-25-2t')">
-          <div style="font-size:0.78rem; font-weight:800; color:var(--text-primary);">⚡ Estándar 10/65/25</div>
+          <div style="font-size:0.78rem; font-weight:800; color:var(--text-primary);">⚡ Estándar (5m / Foco / 5m / 25m)</div>
           <div style="font-size:0.71rem; color:var(--text-secondary);">2 Tramos Foco + 1 Pausa</div>
         </div>
         <div class="dist-option-card ${initialDist === '10-65-25-3t' ? 'selected' : ''}" data-dist="10-65-25-3t" onclick="selectStudyDistribution('10-65-25-3t')">
-          <div style="font-size:0.78rem; font-weight:800; color:var(--text-primary);">🔥 Profundo 10/65/25</div>
+          <div style="font-size:0.78rem; font-weight:800; color:var(--text-primary);">🔥 Profundo ≥120m (7-8m Pausas)</div>
           <div style="font-size:0.71rem; color:var(--text-secondary);">3 Tramos Foco + 2 Pausas</div>
         </div>
         <div class="dist-option-card ${initialDist === 'recuperacion' ? 'selected' : ''}" data-dist="recuperacion" onclick="selectStudyDistribution('recuperacion')">
-          <div style="font-size:0.78rem; font-weight:800; color:var(--accent-solar);">🟡 Recuperación (10/50/40)</div>
+          <div style="font-size:0.78rem; font-weight:800; color:var(--accent-solar);">🟡 Recuperación (30-35m Síntesis)</div>
           <div style="font-size:0.71rem; color:var(--text-secondary);">Fatiga alta: +40% Síntesis</div>
         </div>
         <div class="dist-option-card ${initialDist === 'continua' ? 'selected' : ''}" data-dist="continua" onclick="selectStudyDistribution('continua')">
@@ -5258,38 +5410,23 @@ function computeDrawerSegments(totalMins, startMinVal) {
   if (d === '10-65-25-2t') {
     return {
       label: 'Estándar 10/65/25 (2 Tramos)',
-      badge: '10% / 65% / 25% • 2 Tramos',
+      badge: '5m • Foco • 5m • 25m Síntesis',
       segments: computeMicroBreakdown(totalMins, '2-tramos', startMinVal).segments
     };
   }
   if (d === '10-65-25-3t') {
     return {
       label: 'Profundo 10/65/25 (3 Tramos)',
-      badge: '10% / 65% / 25% • 3 Tramos',
+      badge: '5m • Foco • 7-8m • 5m • 25m',
       segments: computeMicroBreakdown(totalMins, '3-tramos', startMinVal).segments
     };
   }
   if (d === 'recuperacion') {
-    const p1 = Math.max(2, Math.round(totalMins * 0.10));
-    const p3 = Math.max(5, Math.round(totalMins * 0.40));
-    const pause = Math.max(3, Math.round(totalMins * 0.08));
-    const p2 = Math.max(5, totalMins - p1 - p3 - pause);
-    const raw = [
-      { label: '1. Priming Suave (10%)', mins: p1, type: 'priming' },
-      { label: '2. Foco Ligero (50%)', mins: p2, type: 'focus' },
-      { label: 'Pausa Descanso', mins: pause, type: 'pause' },
-      { label: '3. Síntesis & Repaso (40%)', mins: p3, type: 'synthesis' }
-    ];
-    let cur = startMinVal;
-    const segments = raw.map(s => {
-      const clockRange = cur !== null ? `${minutesToTime(cur)}–${minutesToTime(cur + s.mins)}` : '';
-      if (cur !== null) cur += s.mins;
-      return { ...s, clockRange };
-    });
+    const bd = computeMicroBreakdown(totalMins, 'recuperacion', startMinVal);
     return {
-      label: 'Modo Recuperación (10/50/40)',
-      badge: '10% / 50% / 40% • Anti-Fatiga',
-      segments
+      label: `Modo Recuperación (5m Priming • 5m Pausa • ${bd.synthesis}m Síntesis)`,
+      badge: `5m • Foco • 5m • ${bd.synthesis}m Síntesis`,
+      segments: bd.segments
     };
   }
   if (d === 'continua') {
@@ -5802,8 +5939,8 @@ let focusTimerState = {
   steps: [],
   currentStepIdx: 0,
   isRunning: false,
-  remainingSec: 540,
-  totalStepSec: 540,
+  remainingSec: 300,
+  totalStepSec: 300,
   isOvertime: false,
   overtimeSec: 0,
   elapsedFreeSec: 0,
@@ -5814,10 +5951,70 @@ let focusTimerState = {
   currentStepFocusSec: 0,
   accumulatedFocusSec: 0,
   accumulatedDistractionSec: 0,
+  longBreakActive: false,
+  longBreakTotalSec: 1800,
+  longBreakRemainingSec: 1800,
   intervalId: null,
   activeAudioObj: null,
   audioStopTimeoutId: null
 };
+
+function getTodayAccumulatedFocusMinutes() {
+  const todayISO = getTodayISO();
+  const loggedMins = (appState.sessionLogs || [])
+    .filter(l => l.date === todayISO)
+    .reduce((a, l) => a + (Number(l.actualMinutes) || 0), 0);
+  const liveFocusMins = Math.round((focusTimerState.accumulatedFocusSec || 0) / 60);
+  return loggedMins + liveFocusMins;
+}
+
+function checkAndTriggerMandatoryLongBreak() {
+  const todayISO = getTodayISO();
+  if (appState.dailyLongBreakTriggeredDate === todayISO) return false;
+  if (focusTimerState.longBreakActive) return true;
+
+  const totalTodayMins = getTodayAccumulatedFocusMinutes();
+  if (totalTodayMins > 120) {
+    appState.dailyLongBreakTriggeredDate = todayISO;
+    saveState();
+
+    pauseFocusTimer();
+    focusTimerState.longBreakActive = true;
+    focusTimerState.longBreakTotalSec = 30 * 60;
+    focusTimerState.longBreakRemainingSec = 30 * 60;
+    focusTimerState.isOvertime = false;
+    focusTimerState.overtimeSec = 0;
+    focusTimerState.isRunning = true;
+    focusTimerState.intervalId = setInterval(tickFocusTimer, 1000);
+
+    playTimerAlarmSound(false);
+    triggerBrowserNotification(
+      '🛑 Break Largo Obligatorio: 30 min',
+      `Has superado los 120 minutos (${totalTodayMins} min) de estudio enfocado hoy. Descansa 30 minutos antes de continuar.`
+    );
+    showToast('🛑 ¡Superaste 2h (120m) de estudio hoy! Break Largo Obligatorio de 30 min activado.');
+    return true;
+  }
+  return false;
+}
+
+function dismissMandatoryLongBreak(forceStart = false) {
+  stopTimerAlarmSound();
+  if (focusTimerState.longBreakRemainingSec > 0 && !forceStart) {
+    showToast('⏳ Aún quedan minutos del Break Largo Obligatorio. Usa "Iniciar ahora de todos modos" si deseas omitirlo.');
+    return;
+  }
+  focusTimerState.longBreakActive = false;
+  focusTimerState.longBreakRemainingSec = 30 * 60;
+  focusTimerState.longBreakTotalSec = 30 * 60;
+  if (focusTimerState.intervalId) {
+    clearInterval(focusTimerState.intervalId);
+    focusTimerState.intervalId = null;
+  }
+  focusTimerState.isRunning = false;
+  renderAll();
+  showToast('✅ Break Largo finalizado. Listo para arrancar el siguiente bloque.');
+}
 
 function buildTimerSequenceSteps() {
   const s = focusTimerState;
@@ -5848,16 +6045,13 @@ function buildTimerSequenceSteps() {
   }
 
   if (s.scheme === 'recuperacion') {
-    const p1 = Math.max(2, Math.round(total * 0.10));
-    const p3 = Math.max(5, Math.round(total * 0.40));
-    const pause = Math.max(3, Math.round(total * 0.08));
-    const p2 = Math.max(5, total - p1 - p3 - pause);
-    return [
-      { label: '1. Priming Suave (10%)', mins: p1, type: 'priming', isBreak: false },
-      { label: '2. Foco Ligero (50%)', mins: p2, type: 'focus', isBreak: false },
-      { label: '☕ Break Descanso', mins: pause, type: 'pause', isBreak: true },
-      { label: '3. Síntesis & Repaso (40%)', mins: p3, type: 'synthesis', isBreak: false }
-    ];
+    const micro = computeMicroBreakdown(total, 'recuperacion', null);
+    return micro.segments.map(seg => ({
+      label: seg.label,
+      mins: seg.mins,
+      type: seg.type,
+      isBreak: seg.type === 'pause'
+    }));
   }
 
   const mode = s.scheme === '10-65-25-3t' ? '3-tramos' : '2-tramos';
@@ -5872,14 +6066,16 @@ function buildTimerSequenceSteps() {
 
 function initFocusTimerSequence(preserveAccumulated = false) {
   pauseFocusTimer();
+  focusTimerState.longBreakActive = false;
   focusTimerState.steps = buildTimerSequenceSteps();
   focusTimerState.currentStepIdx = 0;
-  const first = focusTimerState.steps[0] || { mins: 25 };
-  focusTimerState.totalStepSec = first.mins * 60;
-  focusTimerState.remainingSec = first.mins * 60;
+  const first = focusTimerState.steps[0] || { mins: 5 };
+  focusTimerState.totalStepSec = Math.max(1, Math.round(first.mins * 60));
+  focusTimerState.remainingSec = Math.max(1, Math.round(first.mins * 60));
   focusTimerState.isOvertime = false;
   focusTimerState.overtimeSec = 0;
   focusTimerState.elapsedFreeSec = 0;
+  focusTimerState.currentStepFocusSec = 0;
   if (!preserveAccumulated) {
     focusTimerState.sessionStartedAtHHMM = null;
     focusTimerState.accumulatedFocusSec = 0;
@@ -5959,11 +6155,32 @@ function resetCurrentTimerStep() {
 
 function tickFocusTimer() {
   const s = focusTimerState;
+
+  if (s.longBreakActive) {
+    if (s.longBreakRemainingSec > 0) {
+      s.longBreakRemainingSec -= 1;
+      if (s.longBreakRemainingSec === 0) {
+        playTimerAlarmSound(false);
+        triggerBrowserNotification(
+          '✅ Break Largo de 30 min Completado',
+          'Tu descanso obligatorio de 30 minutos ha terminado. Ya puedes iniciar el siguiente bloque.'
+        );
+        if (appState.activeTab === 'focus') renderAll();
+      }
+    }
+    updateLiveTimerDOM();
+    return;
+  }
+
   const curStep = s.steps[s.currentStepIdx] || { label: 'Enfoque', isBreak: false };
 
   if (s.scheme === 'free-chrono') {
     s.elapsedFreeSec += 1;
     s.accumulatedFocusSec += 1;
+    if (checkAndTriggerMandatoryLongBreak()) {
+      if (appState.activeTab === 'focus') renderAll();
+      return;
+    }
     if (s.freeReminderEvery30m && s.elapsedFreeSec > 0 && s.elapsedFreeSec % 1800 === 0) {
       playTimerAlarmSound(true);
       triggerBrowserNotification('⏱️ Recordatorio de Enfoque', `Llevas ${Math.round(s.elapsedFreeSec / 60)} min en cronómetro libre.`);
@@ -5978,6 +6195,10 @@ function tickFocusTimer() {
       if (!curStep.isBreak) {
         s.accumulatedFocusSec += 1;
         s.currentStepFocusSec = (s.currentStepFocusSec || 0) + 1;
+        if (checkAndTriggerMandatoryLongBreak()) {
+          if (appState.activeTab === 'focus') renderAll();
+          return;
+        }
       }
       if (s.remainingSec === 0) {
         // Llegó a 00:00 -> Entra en modo Tiempo Extra (+MM:SS) y dispara alarma + notificación
@@ -6052,6 +6273,11 @@ function updateLiveTimerDOM() {
   const liveAccDist = document.getElementById('ft-live-acc-dist');
   if (liveAccFocus) liveAccFocus.textContent = formatMinutesOrHours(Math.round(s.accumulatedFocusSec / 60));
   if (liveAccDist) liveAccDist.textContent = formatMinutesOrHours(Math.round(s.accumulatedDistractionSec / 60));
+
+  const lbDigits = document.getElementById('ft-longbreak-digits');
+  if (lbDigits && s.longBreakActive) {
+    lbDigits.textContent = formatClockDisplay(s.longBreakRemainingSec, false, 0, false, 0);
+  }
 }
 
 // Los 3 botones de transición cuando termina un tramo (o cuando estás en tiempo extra)
@@ -6094,8 +6320,8 @@ function resolveStepOvertimeAndAdvance(decision) {
   if (s.currentStepIdx + 1 < s.steps.length) {
     s.currentStepIdx += 1;
     const nextStep = s.steps[s.currentStepIdx];
-    s.totalStepSec = nextStep.mins * 60;
-    s.remainingSec = nextStep.mins * 60;
+    s.totalStepSec = Math.max(1, Math.round(nextStep.mins * 60));
+    s.remainingSec = s.totalStepSec;
     s.isOvertime = false;
     s.overtimeSec = 0;
     if (!s.isRunning) {
@@ -6111,6 +6337,138 @@ function resolveStepOvertimeAndAdvance(decision) {
     renderAll();
     finishFocusSessionAndOpenDrawer();
   }
+}
+
+function skipCurrentPhaseWithReassignment() {
+  stopTimerAlarmSound();
+  const s = focusTimerState;
+  if (!Array.isArray(s.steps) || s.steps.length === 0) return;
+  const curStep = s.steps[s.currentStepIdx];
+  if (!curStep) return;
+
+  const canReassign = curStep.type === 'priming' || curStep.isBreak || curStep.type === 'pause';
+  const leftoverSec = (!s.isOvertime && canReassign) ? Math.max(0, s.remainingSec) : 0;
+  const leftoverMins = Math.round((leftoverSec / 60) * 10) / 10;
+
+  curStep.completed = true;
+  s.currentStepFocusSec = 0;
+  s.isOvertime = false;
+  s.overtimeSec = 0;
+
+  if (s.currentStepIdx + 1 < s.steps.length) {
+    s.currentStepIdx += 1;
+    const nextStep = s.steps[s.currentStepIdx];
+
+    if (leftoverSec > 0) {
+      // Buscar el siguiente tramo de Foco Activo para sumarle los segundos/minutos restantes
+      let targetFocusIdx = -1;
+      for (let i = s.currentStepIdx; i < s.steps.length; i++) {
+        if (!s.steps[i].isBreak && s.steps[i].type === 'focus') {
+          targetFocusIdx = i;
+          break;
+        }
+      }
+      if (targetFocusIdx === s.currentStepIdx) {
+        const addedSec = leftoverSec;
+        nextStep.mins = Math.round((nextStep.mins + leftoverMins) * 10) / 10;
+        s.totalStepSec = Math.max(1, Math.round(nextStep.mins * 60) + (addedSec - Math.round(leftoverMins * 60)));
+        s.remainingSec = s.totalStepSec;
+        showToast(`⏭️ Fase saltada: +${Math.round(leftoverSec / 60)}m reasignados a ${nextStep.label}.`);
+      } else if (targetFocusIdx > s.currentStepIdx) {
+        const targetFocusStep = s.steps[targetFocusIdx];
+        targetFocusStep.mins = Math.round((targetFocusStep.mins + leftoverMins) * 10) / 10;
+        s.totalStepSec = Math.max(1, Math.round(nextStep.mins * 60));
+        s.remainingSec = s.totalStepSec;
+        showToast(`⏭️ Fase saltada: +${Math.round(leftoverSec / 60)}m sumados a ${targetFocusStep.label}.`);
+      } else {
+        s.totalStepSec = Math.max(1, Math.round(nextStep.mins * 60));
+        s.remainingSec = s.totalStepSec;
+      }
+    } else {
+      s.totalStepSec = Math.max(1, Math.round(nextStep.mins * 60));
+      s.remainingSec = s.totalStepSec;
+    }
+
+    if (!s.isRunning) {
+      s.isRunning = true;
+      s.intervalId = setInterval(tickFocusTimer, 1000);
+    }
+    renderAll();
+  } else {
+    pauseFocusTimer();
+    renderAll();
+    finishFocusSessionAndOpenDrawer();
+  }
+}
+
+function triggerLiveDistractionCut() {
+  stopTimerAlarmSound();
+  const s = focusTimerState;
+  const curStep = s.steps[s.currentStepIdx];
+  if (!curStep || curStep.isBreak) {
+    showToast('⚡ El sensor de corte de foco está pensado para tramos de enfoque activo.');
+    return;
+  }
+
+  const enduredSec = Math.max(60, s.currentStepFocusSec || Math.max(60, (curStep.mins * 60) - s.remainingSec));
+  const minutesEndured = Math.max(1, Math.round(enduredSec / 60));
+  const meta = resolveCurrentTimerSubjectAndTopic();
+
+  if (!Array.isArray(appState.resistanceRecords)) appState.resistanceRecords = [];
+  appState.resistanceRecords.push({
+    date: getTodayISO(),
+    subjectId: meta.subjectId || null,
+    topicId: meta.topicId || null,
+    minutesEndured,
+    source: 'live_sensor'
+  });
+
+  // Descontar los 5 minutos de pausa de recuperación del tiempo de foco restante en este tramo
+  const recoveryPauseSec = 5 * 60;
+  const remFocusAfterCutSec = Math.max(60, s.remainingSec - recoveryPauseSec);
+  const newFocusMins = Math.max(1, Math.round(remFocusAfterCutSec / 60));
+
+  curStep.mins = newFocusMins;
+  s.currentStepFocusSec = 0;
+  s.isOvertime = false;
+  s.overtimeSec = 0;
+
+  // Insertar pausa de recuperación de 5m inmediatamente y dejar el foco restante ajustado después
+  const pauseStep = {
+    label: '☕ Pausa Recuperación (5m • Descontada)',
+    mins: 5,
+    type: 'pause',
+    isBreak: true,
+    isRecoveryBreak: true,
+    canExtendExtra5: true
+  };
+
+  s.steps.splice(s.currentStepIdx + 1, 0, pauseStep);
+  s.currentStepIdx += 1;
+  s.totalStepSec = recoveryPauseSec;
+  s.remainingSec = recoveryPauseSec;
+
+  if (!s.isRunning) {
+    s.isRunning = true;
+    s.intervalId = setInterval(tickFocusTimer, 1000);
+  }
+
+  saveState();
+  renderAll();
+  showToast(`🧠 Resistencia registrada: ${minutesEndured}m aguantados. Pausa de 5m iniciada (descontada del foco restante).`);
+}
+
+function extendRecoveryBreakExtra5Min() {
+  const s = focusTimerState;
+  const curStep = s.steps[s.currentStepIdx];
+  if (!curStep || !curStep.isBreak) return;
+  curStep.mins = (Number(curStep.mins) || 5) + 5;
+  s.totalStepSec += 300;
+  s.remainingSec += 300;
+  s.isOvertime = false;
+  s.overtimeSec = 0;
+  renderAll();
+  showToast('➕ +5 min extra añadidos a la pausa de recuperación.');
 }
 
 function jumpToTimerStep(idx) {
@@ -6364,11 +6722,20 @@ function renderFocusTimerView(plan) {
 
   return `
     <div class="timer-layout">
+      ${(() => {
+        const resStats = computeResistanceStats();
+        const resDisplay = resStats.count > 0
+          ? `${resStats.min}m / ${resStats.avg}m / ${resStats.max}m`
+          : 'Sin cortes aún';
+        return `
       <!-- BARRA SUPERIOR DE MÉTRICAS DE HOY -->
       <div class="timer-top-stats">
         <div>
           <div style="display:flex; align-items:center; gap:0.55rem; flex-wrap:wrap; margin-bottom:0.25rem;">
             <span class="streak-banner-pill">🔥 ${computeActionStreakInfo().streakDays} día(s) Tomando Acción</span>
+            <span class="time-slot-pill" title="Mínimo / Promedio / Máximo de resistencia cognitiva">
+              🧠 Umbral Resistencia: <strong>${resDisplay}</strong>
+            </span>
             <span style="font-size:0.75rem; color:var(--text-muted);">🏯 ${appState.routineGoals?.sanctuary || 'Santuario activo'}</span>
           </div>
           <div style="font-size:0.84rem; color:var(--text-secondary);">
@@ -6387,6 +6754,8 @@ function renderFocusTimerView(plan) {
           </div>
         </div>
       </div>
+        `;
+      })()}
 
       <!-- SELECTOR DE TAREA, DURACIÓN Y DISTRIBUCIÓN -->
       <div class="section-panel" style="margin-bottom:0; padding:1.1rem 1.25rem;">
@@ -6437,15 +6806,37 @@ function renderFocusTimerView(plan) {
               🔀 Distribución Automática de Fases
             </label>
             <select onchange="setTimerScheme(this.value)" style="width:100%; font-weight:600;">
-              <option value="10-65-25-2t" ${s.scheme === '10-65-25-2t' ? 'selected' : ''}>⚡ Estándar 10 / 65 / 25 (2 Tramos + 1 Break)</option>
-              <option value="10-65-25-3t" ${s.scheme === '10-65-25-3t' ? 'selected' : ''}>🔥 Profundo 10 / 65 / 25 (3 Tramos + 2 Breaks)</option>
-              <option value="recuperacion" ${s.scheme === 'recuperacion' ? 'selected' : ''}>🟡 Modo Recuperación 10 / 50 / 40 (Fatiga alta)</option>
+              <option value="10-65-25-2t" ${s.scheme === '10-65-25-2t' ? 'selected' : ''}>⚡ Estándar (5m Priming • Foco • 5m Pausa • 25m Síntesis)</option>
+              <option value="10-65-25-3t" ${s.scheme === '10-65-25-3t' ? 'selected' : ''}>🔥 Profundo ≥120m (5m Priming • Foco 7-8m • 5m Pausa • 25m Síntesis)</option>
+              <option value="recuperacion" ${s.scheme === 'recuperacion' ? 'selected' : ''}>🟡 Modo Recuperación (5m Priming • Foco • 5m Pausa • 30-35m Síntesis)</option>
               <option value="pomodoro" ${s.scheme === 'pomodoro' ? 'selected' : ''}>🍅 Pomodoro Clásico (${s.pomoFocusMins}m Foco / ${s.pomoBreakMins}m Break)</option>
               <option value="free-chrono" ${s.scheme === 'free-chrono' ? 'selected' : ''}>♾️ Cronómetro Libre (Cuenta desde 00:00)</option>
             </select>
           </div>
         </div>
       </div>
+
+      ${s.longBreakActive ? `
+        <div class="overtime-decision-box" style="background:rgba(42, 157, 143, 0.14); border-color:var(--accent-green);">
+          <div style="font-size:0.9rem; font-weight:800; color:var(--accent-green);">
+            🛑 Break Largo Obligatorio: 30 min (Superaste 2h / 120m de estudio hoy)
+          </div>
+          <div id="ft-longbreak-digits" style="font-size:2.2rem; font-weight:800; font-variant-numeric:tabular-nums; color:var(--text-primary);">
+            ${formatClockDisplay(s.longBreakRemainingSec, false, 0, false, 0)}
+          </div>
+          <div style="font-size:0.79rem; color:var(--text-secondary);">
+            Aléjate de pantallas, hidrátate o haz movilidad antes de iniciar el siguiente bloque.
+          </div>
+          <div style="display:flex; gap:0.55rem; justify-content:center; flex-wrap:wrap;">
+            <button type="button" class="btn-primary" onclick="dismissMandatoryLongBreak(false)">
+              ▶ Continuar con el Siguiente Bloque
+            </button>
+            <button type="button" style="font-size:0.78rem;" onclick="dismissMandatoryLongBreak(true)">
+              ⏭️ Iniciar ahora de todos modos
+            </button>
+          </div>
+        </div>
+      ` : ''}
 
       <!-- TARJETA CENTRAL DEL RELOJ CIRCULAR -->
       <div class="timer-main-card">
@@ -6516,8 +6907,26 @@ function renderFocusTimerView(plan) {
           ` : ''}
         </div>
 
-        <!-- BOTONES RÁPIDOS DE DISTRACCIÓN EN VIVO Y CIERRE DE SESIÓN -->
+        ${(curStep.type === 'priming' || curStep.isBreak || curStep.type === 'pause') ? `
+          <div style="display:flex; gap:0.5rem; flex-wrap:wrap; justify-content:center;">
+            <button type="button" class="btn-gold" style="font-size:0.8rem;" onclick="skipCurrentPhaseWithReassignment()">
+              ⏭️ Saltar fase (Sumar restante a Foco)
+            </button>
+            ${curStep.isBreak ? `
+              <button type="button" style="font-size:0.78rem;" onclick="extendRecoveryBreakExtra5Min()">
+                ➕ +5 min extra
+              </button>
+            ` : ''}
+          </div>
+        ` : ''}
+
+        <!-- SENSOR DE RESISTENCIA EN VIVO, DISTRACCIONES Y CIERRE DE SESIÓN -->
         <div style="display:flex; gap:0.5rem; flex-wrap:wrap; justify-content:center;">
+          ${!curStep.isBreak && curStep.type === 'focus' ? `
+            <button type="button" class="btn-danger" style="font-size:0.78rem;" onclick="triggerLiveDistractionCut()">
+              ⚡ Me desconcentré / Necesito pausa ahora
+            </button>
+          ` : ''}
           <button type="button" style="font-size:0.76rem;" onclick="addQuickDistractionMinutes(1)">⚡ +1m Distracción</button>
           <button type="button" style="font-size:0.76rem;" onclick="addQuickDistractionMinutes(5)">⚡ +5m Distracción</button>
           <button type="button" class="btn-gold" style="font-size:0.78rem;" onclick="finishFocusSessionAndOpenDrawer()">
